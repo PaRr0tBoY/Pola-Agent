@@ -1,4 +1,5 @@
-import anthropic
+#!/usr/bin/python3
+
 import os
 import subprocess
 
@@ -9,13 +10,14 @@ GREEN = "\033[36m"
 RESET = "\033[0m"
 
 from dotenv import load_dotenv
+from anthropic import Anthropic
 
 load_dotenv(override = True)
 
 if os.getenv("ANTHROPIC_BASE_URL"):
   os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
-client = anthropic.Anthropic();
+client = Anthropic();
 MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are my personal assistant at {os.getcwd()}. Use bash to solve tasks. Act, and explain what you did."
@@ -95,8 +97,24 @@ if __name__ == "__main__":
       break
     if query.strip().lower() in ("q", "exit", "fuck"):
       break
-    history.append({"role": "user", "content": query})
-    agent_loop(history)
+    if query.startswith("!"):
+      cmd = f"powershell -Command {query[1:].strip()}"
+      res = subprocess.run(
+        cmd,
+        shell=True,
+        capture_output=True,
+        cwd = os.getcwd(),
+        timeout=120)
+      raw = (res.stdout or b"") + (res.stderr or b"")
+      try:
+        out = raw.decode("utf-8").strip()
+      except UnicodeDecodeError:
+        out = raw.decode("gbk", errors="replace").strip()
+      print(f"{GRAY}{out[:50000] if out else '(无输出)'}{RESET}")
+      history.append({"role": "user", "content": out[:50000] if out else "(无输出)"})
+    else:
+      history.append({"role": "user", "content": query})
+      agent_loop(history)
 
     resp_content = history[-1]["content"]
     if isinstance(resp_content, list):
