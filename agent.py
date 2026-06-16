@@ -33,7 +33,7 @@ WORKDIR = Path.cwd()
 client = Anthropic()
 MODEL = os.environ["MODEL_ID"]
 
-SYSTEM = f"You are my Pola,my personal assistant at {WORKDIR}. Use bash to solve tasks. Act, and explain what you did."
+SYSTEM = f"You are Pola, my personal assistant at {WORKDIR}. Use bash to solve tasks. Act, and explain what you did."
 
 
 TOOLS = [
@@ -51,7 +51,7 @@ TOOLS = [
         "description": "Read file contents.",
         "input_schema": {
             "type": "object",
-            "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}},
+            "properties": {"path": {"type": "string"}, "start": {"type": "integer"}, "limit": {"type": "integer"}},
             "required": ["path"],
         },
     },
@@ -89,7 +89,7 @@ TOOLS = [
 ]
 
 
-def run_bash(command):
+def run_bash(command, **kwargs):
     danger = ["rmdir", "rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in danger):
         return "危险！请避免尝试执行高风险指令。"
@@ -120,9 +120,13 @@ def safe_path(p):
     return path
 
 
-def run_read(path, limit: int | None = None, **kwargs):
+def run_read(path, start: int = 0, limit: int | None = None, **kwargs):
     try:
         lines = safe_path(path).read_text().splitlines()
+        total = len(lines)
+        if start >= total:
+            return "(起始行超出文件长度)"
+        lines = lines[start:]
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
         return "\n".join(lines)
@@ -130,7 +134,7 @@ def run_read(path, limit: int | None = None, **kwargs):
         return f"错误：{e}"
 
 
-def run_write(path, content):
+def run_write(path, content, **kwargs):
     try:
         file_path = safe_path(path)
         file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -140,19 +144,19 @@ def run_write(path, content):
         return f"错误：{e}"
 
 
-def run_edit(path, old_text, new_text):
+def run_edit(path, old_text, new_text, **kwargs):
     try:
         file_path = safe_path(path)
         text = file_path.read_text()
         if old_text not in text:
             return f"{RED}错误：没有命中修改区域，可能要替换的文字不存在，或文件自上次查看已更新{RESET}"
         file_path.write_text(text.replace(old_text, new_text, 1))
-        return f"{GREEN}{path} 已更新{RESET}"
+        return f"{GREEN}Pola已编辑 {path}{RESET}"
     except Exception as e:
         return f"错误：{e}"
 
 
-def run_glob(pattern):
+def run_glob(pattern, **kwargs):
     import glob as g
 
     try:
@@ -160,9 +164,16 @@ def run_glob(pattern):
         for match in g.glob(pattern, root_dir=WORKDIR):
             if (WORKDIR / match).resolve().is_relative_to(WORKDIR):
                 results.append(match)
-        return "\n".join(g.glob(pattern, root_dir=WORKDIR))
+        return "\n".join(results) if results else "(未找到匹配)"
     except Exception as e:
         return f"错误：{e}"
+
+#def run_grep(pattern, **kwargs):
+
+#def run_pr(pattern, **kwargs):
+
+#def resolve_conflict(pattern, **kwargs):
+
 
 
 TOOL_HANDLERS = {
@@ -182,13 +193,14 @@ def agent_loop(messages):
 
         messages.append({"role": "assistant", "content": resp.content})
 
-        if resp.stop_reason == "end_turn":
+        if resp.stop_reason != "tool_use":
+            #print_separator("-")
             return
 
         results = []
         for block in resp.content:
             if block.type == "tool_use":
-                print(f"{YELLOW}Tool_Call({block.name}){RESET}")
+                print(f"{YELLOW}Tool({block.name}){RESET}")
                 handler = TOOL_HANDLERS.get(block.name)
                 output = (
                     handler(**block.input) if handler else f"未能识别：{block.name}"
@@ -211,15 +223,25 @@ def agent_loop(messages):
         messages.append({"role": "user", "content": results})
 
 
+def print_separator(char="-"):
+    try:
+        columns = os.get_terminal_size().columns
+        print(char * columns)
+    except OSError:
+        print(char * 80)
+
+
 if __name__ == "__main__":
     os.system("cls" if os.name == "nt" else "clear")
     print(f"{GREEN}Pola Ready On Call.{RESET}")
-    print("回车发送消息，输入 q 退出. \n")
+    print("回车发送消息，输入 q 退出.")
 
     history = []
     while True:
         try:
-            query = input(f"{GREEN}Pola >> {RESET}")
+            print_separator("-")
+            query = input(f"{GREEN}Pola >>{RESET}")
+            print_separator("-")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", "fuck"):
