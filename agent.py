@@ -33,7 +33,7 @@ WORKDIR = Path.cwd()
 client = Anthropic()
 MODEL = os.environ["MODEL_ID"]
 
-SYSTEM = f"You are Pola, my personal assistant at {WORKDIR}. Use bash to solve tasks. Act, and explain what you did."
+SYSTEM = f"You are Pola, my personal assistant at {WORKDIR}. Use tools to solve tasks. Act, don't explain. You're in a terminal environment with no render engine for markdown,latex,etc. So avoid using markdown syntax."
 
 
 TOOLS = [
@@ -204,10 +204,34 @@ PERMISSION_RULES = [
         "tools": ["bash"],
         "check": lambda args: any(kw in args.get("command", "") for kw in ["rm ", "> /etc/", "chmod 777"]),
         "message": "危险！请避免尝试执行高风险指令"},
-    }
     ]
 
+def check_rules(tool_name, args):
+    for rule in PERMISSION_RULES:
+        if tool_name in rule["tools"] and rule["check"](args):
+            return rule["message"]
+    return None
 
+
+def ask_user(tool_name, args, reason):
+    print(f"\n{GREEN} {reason} {RESET}")
+    print(f"   Tool: {tool_name}({args})")
+    choice = input("   Allow? [y/N] ").strip().lower()
+    return "allow" if choice in ("y", "yes") else "deny"
+
+
+def check_permission(block) -> bool:
+    if block.name == "bash":
+        reason = check_deny_list(block.input.get("command", ""))
+        if reason:
+            print(f"\n\033[31m {reason}\033[0m")
+            return False
+    reason = check_rules(block.name, block.input)
+    if reason:
+        decision = ask_user(block.name, block.input, reason)
+        if decision == "deny":
+            return False
+    return True
 
 def agent_loop(messages):
     while True:
@@ -225,6 +249,11 @@ def agent_loop(messages):
         for block in resp.content:
             if block.type == "tool_use":
                 print(f"{YELLOW}Tool({block.name}){RESET}")
+
+                if not check_permission(block):
+                    results.append({"type": "tool_result", "tool_use_id": block.id, "content": "Permission denied."})
+                    continue
+                
                 handler = TOOL_HANDLERS.get(block.name)
                 output = (
                     handler(**block.input) if handler else f"未能识别：{block.name}"
@@ -257,7 +286,7 @@ def print_separator(char="-"):
 
 if __name__ == "__main__":
     os.system("cls" if os.name == "nt" else "clear")
-    print(f"{GREEN}Pola Ready On Call.{RESET}")
+    print(f"{GREEN}Pola Ready at {WORKDIR}.{RESET}")
     print("回车发送消息，输入 q 退出.")
 
     history = []
