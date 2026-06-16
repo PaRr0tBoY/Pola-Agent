@@ -184,6 +184,30 @@ TOOL_HANDLERS = {
     "glob": run_glob,
 }
 
+DENY_LIST = [
+  "rm -rf /", "sudo", "shutdown", "reboot","mkfs", "dd if=", "> /dev/sda",
+]
+
+def check_deny_list(command):
+    for pattern in DENY_LIST:
+        if pattern in command:
+            return f"已阻止：{pattern} 在当前环境下被禁用"
+    return None;
+
+PERMISSION_RULES = [
+    {
+        "tools": ["write_file", "edit_file"],
+        "check": lambda args: not (WORKDIR / args.get("path", "")).resolve().is_relative_to(WORKDIR),
+        "messages": "写位置超出工作区!",
+    },
+    {
+        "tools": ["bash"],
+        "check": lambda args: any(kw in args.get("command", "") for kw in ["rm ", "> /etc/", "chmod 777"]),
+        "message": "危险！请避免尝试执行高风险指令"},
+    }
+    ]
+
+
 
 def agent_loop(messages):
     while True:
