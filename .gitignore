@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# 本地工作内容（项目文档、素材等）
+工作内容/

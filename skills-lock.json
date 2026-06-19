@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "skills": {
+    "solidworks-automation": {
+      "source": "wzyn20051216/solidworks-automation-skill",
+      "sourceType": "github",
+      "skillPath": "SKILL.md",
+      "computedHash": "6ff1fa27bc7b2fe9b3cc34336d0299381203dab1fe40318cc663632f87dae8fd"
+    },
+    "teach": {
+      "source": "mattpocock/skills",
+      "sourceType": "github",
+      "skillPath": "skills/productivity/teach/SKILL.md",
+      "computedHash": "9cd31ea42b40915ea5fd3949ed229b217d1dfad07dd93d9b0db771dcdd6a6c8a"
+    }
+  }
+}
