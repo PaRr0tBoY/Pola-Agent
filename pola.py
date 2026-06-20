@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
+
 import os, subprocess, ast, json, yaml
 from pathlib import Path
+from rich.console import Console
+from rich.markdown import Markdown
 
 RED = "\033[31m"
 YELLOW = "\033[33m"
@@ -8,16 +11,12 @@ GRAY = "\033[90m"
 GREEN = "\033[36m"
 RESET = "\033[0m"
 
-try:
-    import readline
+from prompt_toolkit import prompt as _pt_prompt
+from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.styles import Style
 
-    readline.parse_and_bind("set bind-tty-special-chars off")
-    readline.parse_and_bind("set input-meta on")
-    readline.parse_and_bind("set output-meta on")
-    readline.parse_and_bind("set convert-meta off")
-except ImportError:
-    pass
-
+_pt_history = InMemoryHistory()
+_pt_style = Style([("prompt", "fg:ansicyan")])
 
 from dotenv import load_dotenv
 from anthropic import Anthropic
@@ -75,7 +74,7 @@ def build_system():
     return (
         f"You are pola, a coding agent at {WORKDIR}."
         f"""
-        Use tools to solve tasks. Act, don't explain. You're in a terminal environment with no render engine for markdown,latex,etc. So avoid using markdown syntax.
+        Use tools to solve tasks. Act, and explain what you did.
         ## About Me
         Name:Acid|Major:Mechanical Manufacturing|Language:Simplify Chinese
         I expect you to act in accordance with the following code of conduct
@@ -160,7 +159,7 @@ def run_bash(command, **kwargs):
         r = subprocess.run(
             command,
             shell=True,
-            cwd=os.getcwd(),
+            cwd=WORKDIR,
             capture_output=True,
             timeout=120,
         )
@@ -185,7 +184,13 @@ def safe_path(p):
 
 def run_read(path, start: int = 0, limit: int | None = None, **kwargs):
     try:
-        lines = safe_path(path).read_text().splitlines()
+        p = safe_path(path)
+        raw = p.read_bytes()
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = raw.decode("gbk", errors="replace")
+        lines = text.splitlines()
         total = len(lines)
         if start >= total:
             return "(起始行超出文件长度)"
@@ -201,7 +206,7 @@ def run_write(path, content, **kwargs):
     try:
         file_path = safe_path(path)
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(content)
+        file_path.write_text(content, encoding="utf-8")
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"错误：{e}"
@@ -210,10 +215,17 @@ def run_write(path, content, **kwargs):
 def run_edit(path, old_text, new_text, **kwargs):
     try:
         file_path = safe_path(path)
-        text = file_path.read_text()
+        raw = file_path.read_bytes()
+        try:
+            text, enc = raw.decode("utf-8"), "utf-8"
+        except UnicodeDecodeError:
+            try:
+                text, enc = raw.decode("utf-8"), "utf-8"
+            except UnicodeDecodeError:
+                return f"错误：无法以 UTF-8 或 GBK 解码 {path}"
         if old_text not in text:
             return f"{RED}错误：没有命中修改区域，可能要替换的文字不存在，或文件自上次查看已更新{RESET}"
-        file_path.write_text(text.replace(old_text, new_text, 1))
+        file_path.write_text(text.replace(old_text, new_text, 1), encoding = enc)
         return f"{GREEN}Pola已编辑 {path}{RESET}"
     except Exception as e:
         return f"错误：{e}"
@@ -256,7 +268,7 @@ def run_todo_write(todos):
     if error:
         return error
     CURRENT_TODOS = todos
-    lines = ["{GRAY}## Current Tasks{RESET}"]
+    lines = [f"{GRAY}## Current Tasks{RESET}"]
     for t in CURRENT_TODOS:
         icon = {"pending": " ", "in_progress": "\033[36m▸\033[0m", "completed": "\033[32m✓\033[0m"}[t["status"]]
         lines.append(f"  [{icon}] {t['content']}")
@@ -273,13 +285,14 @@ def spawn_subagent(description: str) -> str:
     messages = [{"role":"user", "content": description}]
 
     for _ in range(30):
-        resp = client.messages.create(
-            model=SUB_MODEL,
-            system=SUB_SYSTEM,
-            messages = messages,
-            tools = SUB_TOOLS,
-            max_tokens=8000
-        )
+        with client.messages.stream(
+            max_tokens=256000, model=SUB_MODEL, system=SUB_SYSTEM,
+            messages=messages, tools=SUB_TOOLS,
+        ) as stream:
+            for text in stream.text_stream:
+                print(text, end="", flush=True)
+            resp = stream.get_final_message()
+        print()
 
         messages.append({"role":"assistant", "content": resp.content})
 
@@ -322,6 +335,12 @@ def spawn_subagent(description: str) -> str:
             result = "Subagent stopped after 30 turns without final answer."
     print(f"{GRAY}[Subagent done]{RESET}")
     return result
+
+def load_skill(name):
+    skill = SKILL_REGISTRY.get(name)
+    if not skill:
+        return f"Skill not found: {name}"
+    return skill["content"]
 
 #def run_
 #def run_grep(pattern, **kwargs):
@@ -394,6 +413,8 @@ TOOLS = [
              "required": ["description"]
          },
      },
+    {"name": "load_skill", "description": "Load the full content of a skill by name.",
+     "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
 ]
 
 TOOL_HANDLERS = {
@@ -403,7 +424,8 @@ TOOL_HANDLERS = {
     "edit_file": run_edit,
     "glob": run_glob,
     "todo_write": run_todo_write,
-    "spawn": spawn_subagent
+    "spawn": spawn_subagent,
+    "load_skill": load_skill,
 }
 
 HOOKS = {
@@ -499,7 +521,7 @@ def summary_hook(messages):
 
 register_hook("UserPromptSubmit", context_inject_hook)
 register_hook("PreToolUse", permission_hook)
-register_hook("PreToolUse", log_hook)
+# register_hook("PreToolUse", log_hook)
 register_hook("PostToolUse", large_output_hook)
 register_hook("Stop", summary_hook)
 
@@ -516,9 +538,13 @@ def agent_loop(messages):
             })
             rounds_since_todo = 0
 
-        resp = client.messages.create(
-            max_tokens=8000, model=MODEL, messages=messages, tools=TOOLS, system=SYSTEM
-        )
+        with client.messages.stream(
+            max_tokens=256000, model=MODEL, messages=messages, tools=TOOLS, system=SYSTEM
+        ) as stream:
+            for text in stream.text_stream:
+                print(text, end="", flush=True)
+            resp = stream.get_final_message()
+        print()
 
         messages.append({"role": "assistant", "content": resp.content})
 
@@ -583,7 +609,8 @@ def print_separator(char="-"):
 
 
 if __name__ == "__main__":
-    os.system("cls" if os.name == "nt" else "clear")
+    #os.system("cls" if os.name == "nt" else "clear")
+    print("\033[2J\033[H", end="")
     print(f"{GREEN}Pola Ready at {WORKDIR}.{RESET}")
     print("回车发送消息，输入 q 退出.")
 
@@ -591,8 +618,7 @@ if __name__ == "__main__":
     while True:
         try:
             print_separator("-")
-            query = input(f"{GREEN}Pola >>{RESET}")
-            print_separator("-")
+            query = _pt_prompt([("class:prompt", "Pola >> ")], style=_pt_style, history=_pt_history)
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", "fuck"):
@@ -620,5 +646,7 @@ if __name__ == "__main__":
 
         for block in history[-1]["content"]:
             if getattr(block, "type", None) == "text":
-                print(block.text)
+                _console = Console()
+                _console.print(Markdown(block.text))
+                #print(block.text)
                 print()
