@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 
-import os, subprocess, ast, json, yaml
+import os, subprocess, ast, json, yaml, math
 from pathlib import Path
+import win32com.client
 from rich.console import Console
 from rich.markdown import Markdown
 
@@ -139,6 +140,31 @@ def build_system():
 
         **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
         """
+        f"""
+        ## SolidWorks 建模与绘图规范 (SolidWorks Modeling & Sketching Guidelines)
+
+        当你受命使用 `sw_` 前缀的工具进行 3D 建模或绘图时，必须严格遵守以下工业级 CAD 规范：
+
+        ### 5.1 严格的绝对单位制 (SI Units)
+        - **所有工具的长度、半径、深度参数，其内部单位一律是“米 (meters)”！**
+        - 如果用户说 `100mm`，你必须在输入参数时转换为 `0.1`。
+        - 如果用户说 `5cm`，你必须输入 `0.05`。
+        - 绝不允许直接把毫米数值作为参数传入工具。
+
+        ### 5.2 “先选面，后画图”原则 (Select Before Sketching)
+        - 任何 2D 绘图工具（如 `sw_draw_circle`, `sw_draw_rectangle`）在调用前，**必须先有明确选中的基准面或实体表面**。
+        - 在新建零件后，你的第一步应当是调用 `sw_select_plane_or_face` 选中一个初始基准面（如 `"Front Plane"` 前视、`"Top Plane"` 上视 或 `"Right Plane"` 右视）。
+        - 严禁在没有处于任何选中表面的状态下执行绘图工具。
+
+        ### 5.3 实体生成的特征链 (Feature Chain)
+        - 绘制完 2D 草图后，SolidWorks 会按照递增顺序自动为其命名（例如 `Sketch1`, `Sketch2`）。
+        - 如果你无法确定当前草图的名称，请立刻调用 `sw_get_model_structure` 读取特征树，确保名称准确。
+        - 在调用 `sw_extrude_boss`（拉伸）或 `sw_extrude_cut`（切除）时，必须准确传入你想操作的草图名称（如 `"Sketch1"`）。
+
+        ### 5.4 闭环的交付流程 (Execution Workflow)
+        - 一个完整的建模意图应当包含：创建画布 -> 选面 -> 绘图 -> 特征变换（拉伸/切除）-> 导出交付。
+        - 除非用户明确要求停止，否则在建立完 3D 实体后，应当主动使用 `sw_export_to_format` 工具将其导出为用户指定的工业通用格式（如 `STEP`）。
+        """
         f"Skills available:\n{catalog}\n"
         "Use load_skill to get full details when needed."
     )
@@ -158,7 +184,7 @@ def run_bash(command, **kwargs):
     try:
         r = subprocess.run(
             command,
-            shell=True,
+            shell=False,
             cwd=WORKDIR,
             capture_output=True,
             timeout=120,
@@ -241,7 +267,410 @@ def run_glob(pattern, **kwargs):
         return "\n".join(results) if results else "(未找到匹配)"
     except Exception as e:
         return f"错误：{e}"
-    
+
+# =========================================================================
+# SolidWorks 自动化工具集扩展实现
+# =========================================================================
+
+_SW_APP_CACHE = None  # 模块级 COM 连接单例，避免每次工具调用都重连泄漏
+
+def _check_sw_license_service():
+    """检测 SolidWorks Licensing Service 是否运行，停止则提前报错而非让 COM 调用挂起。"""
+    try:
+        import subprocess as _sp
+        r = _sp.run(
+            ["sc", "query", "SolidWorks Licensing Service"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if "RUNNING" not in r.stdout:
+            return "SolidWorks Licensing Service 未运行（状态: %s）。请在 services.msc 启动该服务后再试。" % r.stdout.strip().split("\n")[-1].strip()
+    except Exception:
+        pass  # 检测失败不阻塞，让后续 COM 调用自行处理
+    return None
+
+def _get_sw_app(refresh=False):
+    """获取或连接 SolidWorks 进程。首次连接后缓存，避免每次工具调用重连导致 COM 代理泄漏。"""
+    global _SW_APP_CACHE
+    if _SW_APP_CACHE is not None and not refresh:
+        return _SW_APP_CACHE
+    # license 服务停止时 Dispatch 会挂起，提前检测
+    lic_err = _check_sw_license_service()
+    if lic_err:
+        raise RuntimeError(lic_err)
+    try:
+        _SW_APP_CACHE = win32com.client.GetActiveObject("SldWorks.Application")
+    except Exception:
+        try:
+            _SW_APP_CACHE = win32com.client.Dispatch("SldWorks.Application")
+        except Exception as e:
+            raise RuntimeError(f"无法连接到 SolidWorks 软件，请确保软件已打开。错误: {e}")
+    return _SW_APP_CACHE
+
+def _sw_member(obj, attr_name):
+    """兼容 pywin32 中 COM 成员可能是属性也可能是方法的情况（FirstFeature/GetNextFeature 等）。"""
+    member = getattr(obj, attr_name)
+    try:
+        return member() if callable(member) else member
+    except Exception as exc:
+        msg = str(exc)
+        if "-2147352573" in msg or "找不到成员" in msg or "Member not found" in msg:
+            return member
+        raise
+
+def _empty_callout():
+    """SelectByID2 的 Callout 参数必须用显式 VARIANT(VT_DISPATCH, None)，传 Python None 会类型不匹配。"""
+    return win32com.client.VARIANT(win32com.client.pythoncom.VT_DISPATCH, None)
+
+def _select_by_id(extension, name, sel_type, append=False, mark=0):
+    return extension.SelectByID2(name, sel_type, 0, 0, 0, append, mark, _empty_callout(), 0)
+
+def _find_part_template(sw):
+    """查找零件模板：优先 GetDocumentTemplate 官方接口，再 glob 回退。"""
+    import glob as _g
+    # 1. 首选：SolidWorks 官方 API 直接返回默认零件模板（比自己拼路径更稳，能处理中文模板名）
+    try:
+        tpl = sw.GetDocumentTemplate(1, "", 0, 0, 0)  # 1 = swDocPART
+        if tpl and os.path.isfile(tpl):
+            return tpl
+    except Exception:
+        pass
+
+    # 2. 回退：用户首选项(24) + ProgramData 通配符 + 常见安装目录
+    default = sw.GetUserPreferenceStringValue(24)
+    roots = str(default).split(";") if default else []
+    roots += [
+        r"C:\ProgramData\SolidWorks\SOLIDWORKS *\templates",
+        r"C:\Program Files\SOLIDWORKS Corp\SOLIDWORKS\lang\chinese-simplified",
+        r"C:\Program Files\SolidWorks Corp\SOLIDWORKS\lang\chinese-simplified",
+        r"C:\Program Files\SOLIDWORKS Corp\SOLIDWORKS\lang\english",
+    ]
+    for root in roots:
+        root = root.strip().strip('"')
+        if not root:
+            continue
+        root = os.path.expandvars(os.path.expanduser(root))
+        # 通配符路径用 glob 展开（os.path.isdir 不会展开 *，会直接 False 跳过）
+        candidates = _g.glob(root) if any(c in root for c in "*?") else [root]
+        for cand in candidates:
+            if os.path.isfile(cand) and cand.lower().endswith(".prtdot"):
+                return cand
+            if os.path.isdir(cand):
+                hits = _g.glob(os.path.join(cand, "*.prtdot"))
+                if hits:
+                    return hits[0]
+    raise FileNotFoundError("无法找到零件模板 .prtdot，请在 SolidWorks 选项中设置默认模板路径。")
+
+# --- 1. 基础画布与环境工具 ---
+
+def run_sw_create_new_part(**kwargs):
+    try:
+        sw = _get_sw_app()
+        sw.Visible = True
+        template = _find_part_template(sw)
+        doc = sw.NewDocument(template, 0, 0, 0)
+        # NewDocument 在部分版本会返回 None 但实际已创建，轮询 ActiveDoc 兜底
+        if doc is None:
+            import time as _t
+            for _ in range(20):
+                doc = sw.ActiveDoc
+                if doc is not None:
+                    break
+                _t.sleep(0.25)
+        if doc is None:
+            return "错误：未能成功创建新零件画布（NewDocument 返回 None 且无活动文档）。"
+        return "成功：已创建全新的空白零件画布。"
+    except Exception as e:
+        return f"错误：{e}"
+
+def run_sw_select_plane_or_face(target_name, **kwargs):
+    try:
+        sw = _get_sw_app()
+        model = sw.ActiveDoc
+        if not model:
+            return "错误：当前没有打开任何活动文档。"
+
+        is_plane = "plane" in target_name.lower() or "基准面" in target_name
+        sel_type = "PLANE" if is_plane else "FACE"
+
+        # 基准面尝试中英文别名（Front Plane / 前视基准面 等）
+        aliases = {
+            "Front Plane": "前视基准面", "前视基准面": "Front Plane",
+            "Top Plane": "上视基准面", "上视基准面": "Top Plane",
+            "Right Plane": "右视基准面", "右视基准面": "Right Plane",
+        }
+        candidates = [target_name]
+        if target_name in aliases and aliases[target_name] not in candidates:
+            candidates.append(aliases[target_name])
+
+        for name in candidates:
+            if _select_by_id(model.Extension, name, sel_type):
+                return f"成功：已选中目标 '{name}'。"
+        return f"失败：未能找到或选中目标 '{target_name}'，请检查名称是否正确。"
+    except Exception as e:
+        return f"错误：{e}"
+
+def run_sw_select_face_by_point(x, y, z, entity_type="FACE", **kwargs):
+    """按空间坐标点拾取实体面/边/顶点。解决 SelectByID2 无法按名称选实体面的问题。
+    例如板顶面中心可传 (0, 0, 0.02) 选顶面，传 (0.05, 0.05, 0) 选板底面角点附近的边。"""
+    try:
+        sw = _get_sw_app()
+        model = sw.ActiveDoc
+        if not model:
+            return "错误：当前没有打开任何活动文档。"
+
+        t = str(entity_type).upper()
+        if t not in ("FACE", "EDGE", "VERTEX"):
+            return f"错误：entity_type 必须是 FACE/EDGE/VERTEX，收到 '{entity_type}'。"
+
+        model.ClearSelection2(True)
+        # SelectByID2 传空名称 + 坐标 + 类型，SolidWorks 会拾取该坐标处的实体几何
+        success = model.Extension.SelectByID2(
+            "", t, float(x), float(y), float(z),
+            False, 0, _empty_callout(), 0
+        )
+        if success:
+            return f"成功：已在坐标 ({x}, {y}, {z}) 选中 {t}。"
+        return f"失败：坐标 ({x}, {y}, {z}) 处未命中 {t}。请确认坐标在实体表面/边线上。"
+    except Exception as e:
+        return f"错误：{e}"
+
+def run_sw_get_model_structure(**kwargs):
+    try:
+        sw = _get_sw_app()
+        model = sw.ActiveDoc
+        if not model:
+            return "错误：当前没有活动文档。"
+
+        structure = []
+        feature = _sw_member(model, "FirstFeature")
+        while feature:
+            name = _sw_member(feature, "Name")
+            type_name = _sw_member(feature, "GetTypeName2")
+            structure.append(f"- {name} [{type_name}]")
+            feature = _sw_member(feature, "GetNextFeature")
+
+        return "\n".join(structure) if structure else "(空特征树)"
+    except Exception as e:
+        return f"错误：{e}"
+
+# --- 2. 2D 草图绘制工具 ---
+
+def _ensure_sketch_open(model):
+    """确保草图处于编辑状态。若已在草图内则不重复 InsertSketch（避免反复开关污染轮廓）；
+    若不在草图内则插入新草图。返回 True 表示本次打开了草图（调用方负责关闭），False 表示复用已有草图。"""
+    try:
+        active = model.SketchManager.ActiveSketch
+    except Exception:
+        active = None
+    if active:
+        return False  # 已在草图编辑中，复用，不关闭
+    model.SketchManager.InsertSketch(True)
+    return True  # 本次打开，调用方需关闭
+
+def run_sw_draw_rectangle(width, height, center_x=0.0, center_y=0.0, **kwargs):
+    try:
+        sw = _get_sw_app()
+        model = sw.ActiveDoc
+        if not model: return "错误：没有活动文档。"
+
+        opened = _ensure_sketch_open(model)
+        corner_x = center_x + (width / 2.0)
+        corner_y = center_y + (height / 2.0)
+        model.SketchManager.CreateCenterRectangle(center_x, center_y, 0, corner_x, corner_y, 0)
+        if opened:
+            model.SketchManager.InsertSketch(True)
+        return f"成功：在中心 ({center_x}, {center_y}) 绘制了 {width}x{height} 的矩形草图。"
+    except Exception as e:
+        return f"错误：{e}"
+
+def run_sw_draw_circle(radius, center_x=0.0, center_y=0.0, **kwargs):
+    try:
+        sw = _get_sw_app()
+        model = sw.ActiveDoc
+        if not model: return "错误：没有活动文档。"
+
+        opened = _ensure_sketch_open(model)
+        model.SketchManager.CreateCircleByRadius(center_x, center_y, 0, radius)
+        if opened:
+            model.SketchManager.InsertSketch(True)
+        return f"成功：在中心 ({center_x}, {center_y}) 绘制了半径为 {radius} 的圆。"
+    except Exception as e:
+        return f"错误：{e}"
+
+def run_sw_draw_polygon(sides, radius, center_x=0.0, center_y=0.0, **kwargs):
+    try:
+        sw = _get_sw_app()
+        model = sw.ActiveDoc
+        if not model: return "错误：没有活动文档。"
+
+        if sides < 3: return "错误：多边形边数不能小于3。"
+
+        opened = _ensure_sketch_open(model)
+        points = []
+        for i in range(sides):
+            angle = 2 * math.pi * i / sides
+            px = center_x + radius * math.cos(angle)
+            py = center_y + radius * math.sin(angle)
+            points.append((px, py))
+
+        for i in range(sides):
+            p1 = points[i]
+            p2 = points[(i + 1) % sides]
+            model.SketchManager.CreateLine(p1[0], p1[1], 0, p2[0], p2[1], 0)
+
+        if opened:
+            model.SketchManager.InsertSketch(True)
+        return f"成功：绘制了 {sides} 边形，外接圆半径 {radius}。"
+    except Exception as e:
+        return f"错误：{e}"
+
+# --- 3. 3D 特征生成工具 ---
+
+def run_sw_extrude_boss(sketch_name, depth, **kwargs):
+    try:
+        sw = _get_sw_app()
+        model = sw.ActiveDoc
+        if not model: return "错误：没有活动文档。"
+
+        _select_by_id(model.Extension, sketch_name, "SKETCH")
+
+        feat = model.FeatureManager.FeatureExtrusion3(
+            True, False, False, 0, 0, depth, 0.0,
+            False, False, False, False, 0.0, 0.0,
+            False, False, False, False, True, False, True, 0, 0.0, False
+        )
+        if feat:
+            return f"成功：草图 '{sketch_name}' 已成功实体拉伸，厚度: {depth} 米。"
+        return f"失败：未能完成拉伸，请确保草图 '{sketch_name}' 结构封闭。"
+    except Exception as e:
+        return f"错误：{e}"
+
+def run_sw_extrude_cut(sketch_name, depth=0.0, thru_all=False, **kwargs):
+    try:
+        sw = _get_sw_app()
+        model = sw.ActiveDoc
+        if not model: return "错误：没有活动文档。"
+
+        _select_by_id(model.Extension, sketch_name, "SKETCH")
+
+        end_condition = 1 if thru_all else 0
+        cut_depth = 0.01 if thru_all else depth
+
+        # 与 skill sw_part.extrude_cut 对齐的 27 参数稳定签名
+        # FeatureCut4 在草图与实体表面共面时方向判定会静默失败，按 troubleshooting.md
+        # 的稳定写法：先 flip=False/dir=True，失败则翻 flip，再翻 direction，逐组合重试。
+        # 重试上限由 4 降为 2：第 1 次失败先检查 license 服务是否仍运行，避免 license 挂起时
+        # 无意义重试放大 COM 压力。
+        attempts = [
+            (True,  False, False),  # Sd, Flip, Dir
+            (True,  True,  False),  # 翻转切除侧
+        ]
+        feat = None
+        for idx, (sd, flip, direction) in enumerate(attempts):
+            _select_by_id(model.Extension, sketch_name, "SKETCH")
+            try:
+                feat = model.FeatureManager.FeatureCut4(
+                    sd, flip, direction, end_condition, 0, cut_depth, 0,
+                    False, False, False, False, 0.0, 0.0,
+                    False, False, False, False, False,
+                    True, True, True, True,
+                    False, 0, 0, False, False
+                )
+            except Exception as e:
+                feat = None
+                # 首次失败后检查 license：若服务已停，立即放弃重试，避免挂起
+                if idx == 0:
+                    lic_err = _check_sw_license_service()
+                    if lic_err:
+                        return f"失败：切除异常且 {lic_err}"
+            if feat:
+                break
+
+        if feat:
+            mode = "完全贯穿" if thru_all else f"深度 {depth}m"
+            return f"成功：使用草图 '{sketch_name}' 完成切除（{mode}）。"
+        return f"失败：切除特征创建失败（已尝试 2 种 flip 组合）。请确认草图 '{sketch_name}' 闭合且与实体有交集，或尝试翻转草图平面。"
+    except Exception as e:
+        return f"错误：{e}"
+
+def run_sw_apply_fillet(edge_id, radius, **kwargs):
+    try:
+        sw = _get_sw_app()
+        model = sw.ActiveDoc
+        if not model: return "错误：没有活动文档。"
+
+        _select_by_id(model.Extension, edge_id, "EDGE")
+
+        # 用 skill sw_part.fillet 验证过的 FeatureFillet(195, r, 0, 0, ...)，FeatureFillet3 长参数不稳定
+        feat = model.FeatureManager.FeatureFillet(195, radius, 0, 0, None, None, None)
+        if feat:
+            return f"成功：已对棱边 '{edge_id}' 应用圆角，半径: {radius} 米。"
+        return "失败：无法在该边上生成圆角特征。"
+    except Exception as e:
+        return f"错误：{e}"
+
+# --- 4. 驱动与修改工具 ---
+
+def run_sw_modify_dimension(dimension_name, new_value, **kwargs):
+    try:
+        sw = _get_sw_app()
+        model = sw.ActiveDoc
+        if not model: return "错误：没有活动文档。"
+
+        param = model.Parameter(dimension_name)
+        if not param:
+            return f"错误：未找到名称为 '{dimension_name}' 的尺寸参数。"
+
+        param.SystemValue = new_value
+        model.EditRebuild3()
+        return f"成功：已将尺寸 '{dimension_name}' 修改为 {new_value}，且已重建模型。"
+    except Exception as e:
+        return f"错误：{e}"
+
+# --- 5. 出图与交付工具 ---
+
+def run_sw_export_to_format(file_type, output_path, **kwargs):
+    try:
+        sw = _get_sw_app()
+        model = sw.ActiveDoc
+        if not model: return "错误：没有活动文档。"
+
+        abs_path = str((WORKDIR / output_path).resolve())
+
+        f_type = file_type.upper()
+        if not abs_path.endswith(f".{f_type.lower()}"):
+            abs_path += f".{f_type.lower()}"
+
+        errors = win32com.client.VARIANT(win32com.client.pythoncom.VT_BYREF | win32com.client.pythoncom.VT_I4, 0)
+        warnings = win32com.client.VARIANT(win32com.client.pythoncom.VT_BYREF | win32com.client.pythoncom.VT_I4, 0)
+
+        # 与 skill sw_export._export_generic 对齐：SaveAs + 空 Dispatch 变体作为 ExportFileData
+        model.ClearSelection2(True)
+        success = model.Extension.SaveAs(
+            abs_path, 0, 1, _empty_callout(), errors, warnings
+        )
+        if success:
+            return f"成功：文件已成功导出为 {f_type} 格式，保存至: {output_path}"
+        return f"失败：导出失败。错误码: {errors.value}, 警告码: {warnings.value}"
+    except Exception as e:
+        return f"错误：{e}"
+
+# --- 6. 会话清理工具 ---
+
+def run_sw_close_doc(title=None, **kwargs):
+    """关闭指定标题的文档；未指定标题则关闭当前活动文档。防止多轮建模累积未关闭零件导致内存膨胀与 SaveAs 冲突。"""
+    try:
+        sw = _get_sw_app()
+        if not title:
+            model = sw.ActiveDoc
+            if not model:
+                return "提示：当前没有活动文档可关闭。"
+            title = _sw_member(model, "GetTitle") or _sw_member(model, "GetTitle")
+        sw.CloseDoc(title)
+        return f"成功：已关闭文档 '{title}'。"
+    except Exception as e:
+        return f"错误：{e}"
+
 def _normalize_todos(todos):
     if isinstance(todos, str):
         try:
@@ -415,6 +844,151 @@ TOOLS = [
      },
     {"name": "load_skill", "description": "Load the full content of a skill by name.",
      "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+    # === SOLIDWORKS 扩展 Agent 工具集 ===
+    {
+        "name": "sw_create_new_part",
+        "description": "在 SolidWorks 中初始化并创建一个全新的空白 3D 零件画布 (.sldprt)。",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "sw_select_plane_or_face",
+        "description": "选中特定的基准面(如 'Front Plane'、'Top Plane')或实体表面以供后续绘图。",
+        "input_schema": {
+            "type": "object",
+            "properties": {"target_name": {"type": "string", "description": "目标特征或平面的确切英文/中文名称"}},
+            "required": ["target_name"],
+        },
+    },
+    {
+        "name": "sw_select_face_by_point",
+        "description": "按空间坐标点拾取实体面/边/顶点。实体面无稳定人读名称，SelectByID2 按名称选不到时用此工具。例如板顶面中心传 (0,0,0.02) 选顶面。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "number", "description": "点的 X 坐标 (米)"},
+                "y": {"type": "number", "description": "点的 Y 坐标 (米)"},
+                "z": {"type": "number", "description": "点的 Z 坐标 (米)"},
+                "entity_type": {"type": "string", "enum": ["FACE", "EDGE", "VERTEX"], "default": "FACE", "description": "要拾取的几何类型"}
+            },
+            "required": ["x", "y", "z"],
+        },
+    },
+    {
+        "name": "sw_get_model_structure",
+        "description": "读取当前零件图纸的特征树结构(类似 ls/tree)，用于分析已有建模步骤和草图。 ",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "sw_draw_rectangle",
+        "description": "在当前选中的面上绘制一个中心矩形草图（长度单位一律为米）。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "width": {"type": "number", "description": "矩形宽度 (米)"},
+                "height": {"type": "number", "description": "矩形高度 (米)"},
+                "center_x": {"type": "number", "default": 0.0, "description": "中心点 X 坐标"},
+                "center_y": {"type": "number", "default": 0.0, "description": "中心点 Y 坐标"}
+            },
+            "required": ["width", "height"],
+        },
+    },
+    {
+        "name": "sw_draw_circle",
+        "description": "在当前选中的面上绘制一个圆形草图（长度单位一律为米）。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "radius": {"type": "number", "description": "圆的半径 (米)"},
+                "center_x": {"type": "number", "default": 0.0, "description": "圆心 X 坐标"},
+                "center_y": {"type": "number", "default": 0.0, "description": "圆心 Y 坐标"}
+            },
+            "required": ["radius"],
+        },
+    },
+    {
+        "name": "sw_draw_polygon",
+        "description": "在当前选中的面上通过多线段闭合循环拟合绘制一个正多边形草图。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sides": {"type": "integer", "description": "边数 (必须 >= 3)"},
+                "radius": {"type": "number", "description": "外接圆半径 (米)"},
+                "center_x": {"type": "number", "default": 0.0},
+                "center_y": {"type": "number", "default": 0.0}
+            },
+            "required": ["sides", "radius"],
+        },
+    },
+    {
+        "name": "sw_extrude_boss",
+        "description": "将现有的闭合 2D 草图沿法线垂直拉伸加厚，使之变为 3D 实体实体特征。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sketch_name": {"type": "string", "description": "要拉伸的草图名称，如 'Sketch1'"},
+                "depth": {"type": "number", "description": "拉伸厚度/深度 (米)"}
+            },
+            "required": ["sketch_name", "depth"],
+        },
+    },
+    {
+        "name": "sw_extrude_cut",
+        "description": "利用闭合草图对现有实体特征执行拉伸切除挖肉/打孔操作。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sketch_name": {"type": "string", "description": "用于切除的草图名称，如 'Sketch2'"},
+                "depth": {"type": "number", "description": "切除深度 (米)，在 thru_all 为 true 时可不设"},
+                "thru_all": {"type": "boolean", "default": False, "description": "是否完全贯穿整个实体"}
+            },
+            "required": ["sketch_name"],
+        },
+    },
+    {
+        "name": "sw_apply_fillet",
+        "description": "选中 3D 实体的某一特定锐边，对其应用圆角倒角特征平滑过渡。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "edge_id": {"type": "string", "description": "边缘的标识名称或选择标识"},
+                "radius": {"type": "number", "description": "圆角半径 (米)"}
+            },
+            "required": ["edge_id", "radius"],
+        },
+    },
+    {
+        "name": "sw_modify_dimension",
+        "description": "参数化修改已有尺寸参数的数值并强制触发模型更新重建 (Rebuild)。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "dimension_name": {"type": "string", "description": "尺寸完整名，如 'D1@Sketch1' 或 'D2@Extrude1'"},
+                "new_value": {"type": "number", "description": "更新后的新系统数值 (米)"}
+            },
+            "required": ["dimension_name", "new_value"],
+        },
+    },
+    {
+        "name": "sw_export_to_format",
+        "description": "一键导出当前 3D 模型或图纸到指定的工业生产交付格式中。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_type": {"type": "string", "enum": ["STEP", "IGES", "PDF"], "description": "导出目标后缀"},
+                "output_path": {"type": "string", "description": "导出的工作区相对物理文件路径"}
+            },
+            "required": ["file_type", "output_path"],
+        },
+    },
+    {
+        "name": "sw_close_doc",
+        "description": "关闭指定标题的 SolidWorks 文档；不传 title 则关闭当前活动文档。用于多轮建模后清理累积零件，释放内存与 license 句柄，避免 SaveAs 错误码 1。",
+        "input_schema": {
+            "type": "object",
+            "properties": {"title": {"type": "string", "description": "文档标题（可选，缺省关闭当前活动文档）"}},
+            "required": [],
+        },
+    },
 ]
 
 TOOL_HANDLERS = {
@@ -426,6 +1000,20 @@ TOOL_HANDLERS = {
     "todo_write": run_todo_write,
     "spawn": spawn_subagent,
     "load_skill": load_skill,
+    # SolidWorks 映射绑定
+    "sw_create_new_part": run_sw_create_new_part,
+    "sw_select_plane_or_face": run_sw_select_plane_or_face,
+    "sw_select_face_by_point": run_sw_select_face_by_point,
+    "sw_get_model_structure": run_sw_get_model_structure,
+    "sw_draw_rectangle": run_sw_draw_rectangle,
+    "sw_draw_circle": run_sw_draw_circle,
+    "sw_draw_polygon": run_sw_draw_polygon,
+    "sw_extrude_boss": run_sw_extrude_boss,
+    "sw_extrude_cut": run_sw_extrude_cut,
+    "sw_apply_fillet": run_sw_apply_fillet,
+    "sw_modify_dimension": run_sw_modify_dimension,
+    "sw_export_to_format": run_sw_export_to_format,
+    "sw_close_doc": run_sw_close_doc,
 }
 
 HOOKS = {
@@ -573,9 +1161,14 @@ def agent_loop(messages):
                 continue
                 
             handler = TOOL_HANDLERS.get(block.name)
-            output = (
-                handler(**block.input) if handler else f"未能识别：{block.name}"
-            )
+            try:
+                output = (
+                    handler(**block.input) if handler else f"未能识别：{block.name}"
+                )
+            except TypeError as e:
+                output = f"错误：工具 '{block.name}' 参数不匹配: {e}。请检查传入参数与 schema 是否一致。"
+            except Exception as e:
+                output = f"错误：工具 '{block.name}' 执行异常: {e}"
 
             trigger_hooks("PostToolUse", block, output)
 
