@@ -1,3 +1,11 @@
+chm_api
+chm_const
+chm_vb6
+.agents/parts_library/sessions.db
+.agents/parts_library/step_files/
+deepseek-vision
+skills-lock.json
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -217,5 +225,6 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# ±¾µØ¹¤×÷ÄÚÈİ£¨ÏîÄ¿ÎÄµµ¡¢ËØ²ÄµÈ£©
-¹¤×÷ÄÚÈİ/
+# æœ¬åœ°å·¥ä½œå†…å®¹ï¼ˆé¡¹ç›®æ–‡æ¡£ã€ç´ æç­‰ï¼‰
+å·¥ä½œå†…å®¹/
+projects/
